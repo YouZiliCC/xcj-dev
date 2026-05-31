@@ -507,6 +507,28 @@ type smartRetrieval struct {
 	Rewrite    *pyclient.RewriteResult
 }
 
+// smartVectorFloor 智能检索向量臂的余弦相似度下限（bge-small-zh：相关内容通常 ≥0.65，弱相关 <0.6）。
+const smartVectorFloor = 0.60
+
+// sharedMeaningfulToken 判断两组 token 是否共享至少一个「实义词」(长度≥2 的 bigram / 英文词)，
+// 用来校验 LLM 改写是否仍贴着原始查询（单个常见汉字不算，避免巧合命中）。
+func sharedMeaningfulToken(a, b []string) bool {
+	set := make(map[string]struct{}, len(a))
+	for _, t := range a {
+		if len([]rune(t)) >= 2 {
+			set[t] = struct{}{}
+		}
+	}
+	for _, t := range b {
+		if len([]rune(t)) >= 2 {
+			if _, ok := set[t]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // runSmartRetrieval 复用 SearchSmart 的"rewrite→BM25∪向量→RRF 得 golden"逻辑，供 smart/qa/review-auto 复用。
 func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetrieval, error) {
 	idx, chunks, _ := h.snapshot()
@@ -517,6 +539,18 @@ func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetri
 	rewrite, err := h.Py.Rewrite(ctx, q)
 	if err != nil {
 		log.Printf("[smart] rewrite failed, fallback: %v", err)
+	}
+
+	// 校验改写：若改写结果与原始查询无任何「实义词」(长度≥2 的 bigram / 英文词) 交集，
+	// 判定为改写跑偏/幻觉（曾出现「企业信息安全风险评估」被改写成「甲苯光催化降解」的情况），
+	// 丢弃改写、回退到原始查询，避免整榜返回不相关文献。
+	if rewrite != nil {
+		qTok := search.Tokenize(q)
+		rwTok := search.Tokenize(rewrite.SearchPayload.CoreSemanticSentence + " " + strings.Join(rewrite.SearchPayload.AcademicKeywords, " "))
+		if !sharedMeaningfulToken(qTok, rwTok) {
+			log.Printf("[smart] rewrite rejected (no overlap with query): core=%q", rewrite.SearchPayload.CoreSemanticSentence)
+			rewrite = nil
+		}
 	}
 
 	// 过滤
@@ -532,21 +566,19 @@ func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetri
 		idx.SetAllowed(allowedIDs)
 	}
 
-	// 关键词聚合
+	// 关键词聚合：仅用 学术关键词 + 近义扩展，并始终保留原始查询作为锚点。
+	// 不再混入 potential_variables / research_design_terms（如「平台化程度」这类泛化词），
+	// 它们只贡献常见字符、是无关文献被召回的主因。
 	var kwParts []string
 	if rewrite != nil {
 		kwParts = append(kwParts, rewrite.SearchPayload.AcademicKeywords...)
 		kwParts = append(kwParts, rewrite.SearchPayload.SynonymsAndExtensions...)
-		kwParts = append(kwParts, rewrite.SearchPayload.PotentialVariables...)
-		kwParts = append(kwParts, rewrite.SearchPayload.ResearchDesignTerms...)
 	}
-	if len(kwParts) == 0 {
-		kwParts = []string{q}
-	}
+	kwParts = append(kwParts, q)
 	tokens := search.Tokenize(strings.Join(kwParts, " "))
 	listA := idx.QueryBM25(tokens, search.DefaultFieldWeights(), 200)
 
-	// 向量
+	// 向量：设相似度下限 smartVectorFloor，过滤弱相关 chunk（提高查准率）。
 	var listB []search.Hit
 	core := q
 	if rewrite != nil && strings.TrimSpace(rewrite.SearchPayload.CoreSemanticSentence) != "" {
@@ -556,11 +588,13 @@ func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetri
 	if vecErr != nil {
 		log.Printf("[smart] embed failed: %v", vecErr)
 	} else if len(vecs) > 0 && len(vecs[0]) > 0 {
-		chunkHits := search.TopKChunksByVector(chunks, vecs[0], allowedMap, 200)
+		chunkHits := search.TopKChunksByVector(chunks, vecs[0], allowedMap, smartVectorFloor, 200)
 		listB = search.AggregateChunksToPapers(chunkHits, 200)
 	}
 
-	golden := search.RRF(listA, listB, 60, 50)
+	// 融合后做精度裁剪：尾部去 BM25-only + 断崖截断 + 上限 50。
+	golden := search.RRF(listA, listB, 60, 0)
+	golden = search.PrecisionFilter(golden, 12, 0.55, 50)
 	return &smartRetrieval{Golden: golden, ListBM25: listA, ListVector: listB, Rewrite: rewrite}, nil
 }
 
@@ -1303,7 +1337,7 @@ func (h *Handlers) PaperRelated(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if seedVec != nil {
-		chunkHits := search.TopKChunksByVector(chunks, seedVec, nil, 200)
+		chunkHits := search.TopKChunksByVector(chunks, seedVec, nil, 0, 200)
 		listB = search.AggregateChunksToPapers(chunkHits, 50)
 	}
 

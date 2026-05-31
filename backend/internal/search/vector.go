@@ -37,7 +37,8 @@ type ChunkHit struct {
 }
 
 // TopKChunksByVector 按余弦相似度对 chunks 排序，过滤不在 allowed 中的 paper（allowed 为 nil 时全放行），返回前 topK。
-func TopKChunksByVector(chunks []store.Chunk, query []float32, allowed map[string]bool, topK int) []ChunkHit {
+// minScore 为相似度下限：cosine < minScore 的 chunk 直接丢弃（用于精度：避免大量弱相关 chunk 进入向量榜）。minScore<=0 表示不设下限。
+func TopKChunksByVector(chunks []store.Chunk, query []float32, allowed map[string]bool, minScore float64, topK int) []ChunkHit {
 	if len(chunks) == 0 || len(query) == 0 {
 		return nil
 	}
@@ -50,7 +51,7 @@ func TopKChunksByVector(chunks []store.Chunk, query []float32, allowed map[strin
 			continue
 		}
 		s := Cosine(c.Embedding, query)
-		if s <= 0 {
+		if s <= 0 || s < minScore {
 			continue
 		}
 		hits = append(hits, ChunkHit{
