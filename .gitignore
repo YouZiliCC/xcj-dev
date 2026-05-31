@@ -5,7 +5,10 @@
 # 数据集体量大（上千篇 docx 全文 + CSV），不入 git，改用 scp 分发到部署机
 data/word/
 data/*.csv
+data/*.csv.bak
 data/storage/
+# 补充数据集（学位论文 docx + 万方 XLSX），同样不入 git
+测试数据集补充/
 backend/data/
 node_modules/
 frontend/dist/
