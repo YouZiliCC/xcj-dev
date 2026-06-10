@@ -18,14 +18,14 @@ const ENTRIES: Entry[] = [
     tag: "01",
     title: "文献检索",
     en: "RETRIEVAL",
-    desc: "字段加权 BM25 + 向量语义双路检索。支持传统精确检索与自然语言 AI 增强检索。",
+    desc: "字段加权 BM25 + 向量语义双路检索。支持 AND/OR/NOT 布尔检索式、高级检索与知网式结果筛选。",
   },
   {
     to: "/qa",
     tag: "02",
     title: "智能问答",
     en: "RAG-QA",
-    desc: "提出研究问题，系统自动取证据文献作 RAG 增强，直接作答并附参考文献表。",
+    desc: "提出研究问题，按「概念解释 · 背景 · 方法 · 证据 · 空白」五段结构作答，引用可定位到具体文本块。",
   },
   {
     to: "/review",
@@ -64,15 +64,18 @@ export default function Home() {
           <span className="text-cyan">.</span>
         </h1>
         <p className="mt-3 text-text-2 max-w-2xl leading-relaxed">
-          一个面向中文人文社科文献的研究终端。底层以 BM25 字段加权与稠密向量双路检索 +
-          RRF 融合排序，上层提供智能问答与文献综述，并在每篇论文详情页内置学术智能体。
+          一个面向中文人文社科文献的研究终端。全文按章节与语义边界切分并标注段落作用，
+          底层以 BM25 字段加权与稠密向量双路检索 + RRF 融合排序，支持布尔检索式与知网式筛选；
+          上层提供五段式智能问答与文献综述，并在每篇论文详情页内置学术智能体。
         </p>
         <div className="mt-5 flex flex-wrap gap-2">
           <span className="chip chip-cyan">SQLite</span>
           <span className="chip chip-cyan">本地 BGE 向量</span>
+          <span className="chip chip-cyan">语义边界切分</span>
           <span className="chip chip-amber">BM25 字段加权</span>
           <span className="chip chip-amber">RRF 融合</span>
-          <span className="chip chip-violet">DeepSeek RAG</span>
+          <span className="chip chip-amber">布尔检索</span>
+          <span className="chip chip-violet">Claude Opus RAG</span>
         </div>
       </section>
 

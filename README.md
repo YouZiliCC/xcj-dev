@@ -1,8 +1,8 @@
 # xcj-dev：信息存储与检索系统
 
-一句话定位：一个把 1000 篇万方学术文献从原始 Word 解析、入库、双路检索到大模型综述/问答/单篇智能体全链路打通的本地化教学型系统。
+一句话定位：一个把 1035 篇万方学术文献（998 篇期刊论文 + 37 篇学位论文）从原始 Word 解析、入库、双路检索到大模型综述/问答/单篇智能体全链路打通的本地化教学型系统。
 
-技术栈：**Go**（主业务、检索、排序、API）+ **React**（暗色科技终端风前端）+ **Python FastAPI 侧车**（文档解析、嵌入、LLM 调用）+ **SQLite**（关系表 + 内嵌向量 BLOB）+ 本地 **`BAAI/bge-small-zh-v1.5`** 嵌入 + 火山方舟 **DeepSeek**（`deepseek-v3-2-251201`，OpenAI 兼容）LLM。工具链：Python 用 **uv**、Node 用 **fnm**、Go 原生 `go`。
+技术栈：**Go**（主业务、检索、排序、API）+ **React**（浅色为主、可切换深浅主题的前端）+ **Python FastAPI 侧车**（文档解析、嵌入、LLM 调用）+ **SQLite**（关系表 + 内嵌向量 BLOB）+ 本地 **`BAAI/bge-small-zh-v1.5`** 嵌入 + **Claude Opus 4.8**（`claude-opus-4-8`，经 OpenAI 兼容中转接入，端点/型号由 `.env` 配置）LLM。工具链：Python 用 **uv**、Node 用 **fnm**、Go 原生 `go`。
 
 本仓库是「信息存储与检索」课程集体作业的工程实现。整体结构沿用 [docs/01-数据预处理.md](docs/01-数据预处理.md) → [docs/02-数据存储.md](docs/02-数据存储.md) → [docs/03-检索与排序.md](docs/03-检索与排序.md) → [docs/04-RAG生成.md](docs/04-RAG生成.md) → [docs/05-前端设计.md](docs/05-前端设计.md) 这条由数据到界面的主干。工程上做了务实裁剪：用 SQLite + 内嵌向量作为当前实现（MySQL + ChromaDB 仅作为可选/设计目标保留），便于零依赖跑起来；Python 仅承担文档解析、嵌入计算、LLM 调用三类「重活」，主业务由 Go 后端承担，前端使用 Vite + React + TS 实现可视化交互。下文按「跑起来 → 看明白 → 改得动」三条线索展开。
 
@@ -38,8 +38,8 @@ flowchart LR
     end
 
     subgraph GO[backend  Go API :8080]
-        G1[/api/search 传统检索/]
-        G2[/api/smart-search 智能检索/]
+        G1[/api/search/traditional 传统检索/]
+        G2[/api/search/smart 智能检索/]
         G3[/api/papers/:id 详情/]
         G4[/api/reload 重建索引/]
     end
@@ -134,7 +134,7 @@ xcj-dev/
 可选：
 - **MySQL 8**：仅在需要把默认 SQLite 换成 MySQL 时才需安装，默认实现不依赖（见第五节）
 - 国内网络环境推荐配置 `npm config set registry https://registry.npmmirror.com`
-- 嵌入走本地 `BAAI/bge-small-zh-v1.5`（约 100MB），首次较慢；LLM 走火山方舟 DeepSeek（OpenAI 兼容）
+- 嵌入走本地 `BAAI/bge-small-zh-v1.5`（约 100MB），首次较慢；LLM 走 OpenAI 兼容端点（当前为 Claude Opus 4.8，可在 `.env` 换任意兼容服务）
 
 ### 3.2 配置环境变量
 
@@ -197,9 +197,9 @@ bash scripts/dev.sh --no-py          # 只跑 Go + 前端（不可用智能检�
 | DB_DRIVER         | sqlite                                 | 数据库驱动。可选 `sqlite` / `mysql`                            |
 | DB_DSN            | ./data/storage/papers.db               | DSN。SQLite 为文件路径；MySQL 见下方示例                       |
 | PY_SERVICE_URL    | http://127.0.0.1:8001                  | Go 后端调用 Python 侧车的基地址                                |
-| LLM_BASE_URL      | 火山方舟 OpenAI 兼容端点                | OpenAI 兼容协议端点。当前用火山方舟（Volces Ark）；DashScope/智谱等亦可填写 |
+| LLM_BASE_URL      | OpenAI 兼容端点                         | 当前用支持 Claude 的中转端点；火山方舟/DashScope/智谱等亦可填写 |
 | LLM_API_KEY       | sk-replace-me                          | LLM 鉴权。仅 Python 侧读取，不会下发到前端                     |
-| LLM_MODEL         | deepseek-v3-2-251201                    | LLM 模型名。当前用火山方舟 DeepSeek                            |
+| LLM_MODEL         | claude-opus-4-8                        | LLM 模型名。当前用 Claude Opus 4.8                             |
 | LLM_TEMPERATURE   | 0.2                                    | 生成温度，0~1                                                  |
 | EMBED_BACKEND     | local                                  | 嵌入后端。`local` = sentence-transformers；`openai` = 线上     |
 | EMBED_MODEL       | BAAI/bge-small-zh-v1.5                 | 嵌入模型名（本地为 HuggingFace ID，线上为 OpenAI 嵌入名）      |
@@ -240,11 +240,11 @@ DB_DSN=user:pass@tcp(127.0.0.1:3306)/papers?parseTime=true&charset=utf8mb4&loc=L
 
 [docs/03-检索与排序.md](docs/03-检索与排序.md) 中将检索拆为「客观分流」 + 「双路融合」。本仓库的实现遵循同样的分流策略，但把对外 API 拆为两条独立路径：
 
-### 6.1 模式 A：传统检索（`/api/search`）
+### 6.1 模式 A：传统检索（`/api/search/traditional`）
 
 适用于用户已经清楚要什么、希望对字段进行精确过滤的场景。流程：
 
-1. **结构化过滤**：根据查询参数（年份区间、作者、关键词白名单等）生成 `Allowed_IDs` 候选集。
+1. **布尔解析 + 结构化过滤**：检索框支持布尔表达式（AND / OR / NOT、括号、"精确短语"、`title:` `author:` `journal:` 等字段限定）；「高级检索」面板提供作者/单位/刊名/中图分类/核心期刊/年份区间等知网式硬过滤（同字段多值 OR、字段之间 AND），先生成 `Allowed_IDs` 候选集再进入打分。
 2. **BM25 字段加权打分**：对候选集执行字段加权 BM25。字段权重如下：
 
    | 字段          | 权重 | 说明                                           |
@@ -255,22 +255,22 @@ DB_DSN=user:pass@tcp(127.0.0.1:3306)/papers?parseTime=true&charset=utf8mb4&loc=L
    | 研究设计 design| 4   | 方法学描述，对学术检索价值高（来自第一部分抽取）|
    | 正文 body     | 1    | 兜底，避免错漏                                 |
 
-3. **分页输出**：默认每页 20 条，按 BM25 总分降序返回。
+3. **分页输出**：默认每页 20 条，支持按相关性或发表时间排序；响应同时返回知网式聚合侧栏 `facets`（作者/刊名/年份/核心期刊/中图分类/单位的候选值与命中数，支持同字段多选 OR、字段间 AND 继续筛选）。
 
 特点：可解释、稳定、对查询拼写敏感，适合做对照基线。
 
-### 6.2 模式 B：智能检索（`/api/smart-search`）
+### 6.2 模式 B：智能检索（`/api/search/smart`）
 
 适用于用户用自然语言描述需求、不确定字段关键词的场景。流程：
 
-1. **LLM 查询改写**：把用户原问题拆成「核心实体 / 同义术语 / 方法学限定」，重写为更适合 BM25 命中的查询；同时保留原问题用于向量召回。
+1. **LLM 查询改写**：把用户原问题拆成「核心实体 / 同义术语 / 方法学限定」，重写为更适合 BM25 命中的查询；同时输出可解释的 `boolean_query`（前端展示，点击可转入传统模式重查）和 `filter_conditions` 硬过滤（作者/单位/刊名/核心期刊/中图分类/年份等，仅在用户明确提及时填写）。原问题保留用于向量召回；两路召回前都会先用过滤条件收窄 `Allowed_IDs` 候选集。
 2. **双路检索**：
    - 路 1：用改写后的查询走 6.1 节相同的字段加权 BM25，取 Top K（默认 50）。
-   - 路 2：用原问题做嵌入，对 SQLite 中持久化的向量做余弦近邻召回，取 Top K。
+   - 路 2：用原问题做嵌入，对 SQLite 中持久化的向量做余弦近邻召回，取 Top K（余弦相似度低于 0.60 的结果直接舍弃）；RRF 融合后还会按分数断崖截断尾部弱相关结果。
 3. **RRF 互惠排名融合**：对两路结果按 `score = Σ 1 / (k + rank_i)` 融合（默认 k=60），得到「黄金排行榜」。
-4. **可选 Top 5 RAG**：若请求带 `rag=true`，截取黄金榜 Top 5，拼装上下文（标题 + 摘要 + 研究设计），交给 LLM 生成结构化综述。
+4. **后续生成走独立接口**：综述/问答不再挂在检索请求上——`/api/analyze/generate`（勾选篇目生成综述）、`/api/review/auto|manual`（T3 文献综述）、`/api/qa/answer`（T4 智能问答）复用该融合结果独立完成。
 
-返回体同时包含两路原始排名与最终融合后的列表，便于前端做调试可视化（见 [docs/05-前端设计.md](docs/05-前端设计.md)）。
+返回体同时包含两路原始排名、最终融合列表、改写结果（含 `boolean_query`）与聚合侧栏 `facets`；前端默认隐藏分数，仅展示排名与命中方式（见 [docs/05-前端设计.md](docs/05-前端设计.md)）。
 
 ---
 
@@ -281,27 +281,29 @@ DB_DSN=user:pass@tcp(127.0.0.1:3306)/papers?parseTime=true&charset=utf8mb4&loc=L
 - **详情页连续全文（T1）**：详情接口返回 `full_text`（= 预处理拼接落库的连续原文），详情页正文以单一连续文本展示并可折叠，chunk 切块降级为「命中片段/证据」区。
 - **语义检索修复（T2）**：语义路曾因 chunk 未带嵌入而返回空；修复为带本地 BGE 嵌入重新摄取（向量按 float32 LE → base64 → BLOB 落 `paper_chunks.embedding`），并保留嵌入失败时退化为 BM25-only 的降级路径。
 - **文献综述双模式（T3）**：`/api/review/auto` 自动选 Top5 文献综述，`/api/review/manual` 由 DOI/标题精确定位单篇或直接粘贴文本；两者复用既有综述 Prompt，不修改。
-- **智能问答 RAG-QA（T4）**：`/api/qa/answer` 复用智能检索取证据（默认 Top5、断崖兜底 Top3 并标记证据不足），用独立的新 QA Prompt 直接回答问题，回答下方附参考文献表。
-- **详情页四智能体（T5）**：单篇论文上下文下提供 AI 同读（`chat`）、AI 概要（`summary`）、思维导图（`mindmap`，mermaid）、相关文献（`related`，纯 Go 双路 + RRF、不调 LLM）。
+- **智能问答 RAG-QA（T4）**：`/api/qa/answer` 复用智能检索取证据（默认 Top5、断崖兜底 Top3 并标记证据不足），用独立的 QA Prompt 按固定五段结构（## 概念解释 / 背景说明 / 方法依据 / 经验证据 / 研究空白）作答，正文内嵌 chunk 级 [n] 引用（可点击弹出侧栏查看片段原文、所属章节与段落作用），每段末附「参考文献」行，无证据的段落标注「暂无相关文献证据」；回答下方仍保留参考文献表。
+- **详情页四智能体（T5）**：单篇论文上下文下提供 AI 同读（`chat`）、AI 概要（`summary`）、思维导图（`mindmap`，markmap Markdown 大纲）、相关文献（`related`，纯 Go 双路 + RRF、不调 LLM）。
 
 ## 七、API 一览
 
 | 方法 | 路径                          | 用途                                              | 备注                              |
 |------|-------------------------------|---------------------------------------------------|-----------------------------------|
-| GET  | /healthz                      | 健康检查                                          | 返回 `{"ok":true}`                |
-| GET  | /api/search                   | 传统检索（BM25 + 字段加权）                       | 参数: q, year_from, year_to, page |
-| POST | /api/smart-search             | 智能检索（LLM 改写 + 双路 + RRF + 可选 RAG）       | body: {query, rag, top_k}         |
+| GET  | /api/health                   | 健康检查                                          | 返回 `{"status":"ok"}`            |
+| POST | /api/search/traditional       | 传统检索（布尔表达式 + BM25 字段加权 + 知网式硬过滤） | body: {q, field, sort, page, page_size, filters}；返回 hits/total/facets |
+| POST | /api/search/smart             | 智能检索（LLM 改写含 boolean_query 与 filter_conditions + 双路 + RRF） | body: {q, filters}；返回 golden/rewrite/facets/两路榜单 |
 | GET  | /api/papers/:id               | 论文详情（含研究设计大字段、引用元数据）           |                                   |
-| GET  | /api/papers/:id/analyze       | 触发研究设计分析（调用 Python 侧车）              | 结果会缓存                        |
-| GET  | /api/keywords/top             | 高频关键词分布（用于首页可视化）                  | 参数: limit                       |
+| POST | /api/analyze/run              | 触发研究设计分析（调用 Python 侧车）              | body: {kind, params}              |
+| POST | /api/analyze/generate         | 勾选篇目生成结构化综述                             | body: {q, paper_ids}              |
+| GET  | /api/papers/:id/chunks        | 论文 chunk 列表（命中片段/证据区数据源）          |                                   |
+| GET  | /api/history                  | 检索历史                                          | 参数: limit                       |
 | POST | /api/reload                   | 通知后端重建内存索引（ingest.sh 自动调用）        | 无需鉴权（仅监听本地）            |
-| GET  | /api/stats                    | 当前库的论文数量、覆盖时段、向量进度等             |                                   |
+| GET  | /api/stats                    | 论文数 / chunk 数、年份分布、Top10 期刊（首页可视化数据源） |                                   |
 | POST | /api/qa/answer                | 智能问答 RAG-QA（T4）                              | body: {question, filters?}        |
 | POST | /api/review/auto              | 文献综述·自动模式（T3）                            | body: {q}                         |
 | POST | /api/review/manual            | 文献综述·自选模式（T3）                            | body: {doi?, title?, text?}       |
 | POST | /api/papers/:id/chat          | 详情页 AI 同读（T5）                               | body: {question}                  |
 | POST | /api/papers/:id/summary       | 详情页 AI 概要（T5）                               | 结构化概要/方法/结果/关键词       |
-| POST | /api/papers/:id/mindmap       | 详情页思维导图（T5）                               | 返回 mermaid `mindmap`            |
+| POST | /api/papers/:id/mindmap       | 详情页思维导图（T5）                               | 返回 markmap 用 Markdown 大纲（`{"markdown": ...}`） |
 | POST | /api/papers/:id/related       | 详情页相关文献（T5，纯 Go 不调 LLM）              | 双路 RRF，TopN=20                 |
 
 Python 侧车直暴的接口（仅供 Go 后端调用，前端不应直连）：
@@ -319,14 +321,14 @@ Python 侧车直暴的接口（仅供 Go 后端调用，前端不应直连）：
 
 **Q1. 嵌入太慢，第一次 ingest 卡了好几分钟怎么办？**
 
-本地 `sentence-transformers` 在 CPU 上确实较慢，1000 篇大概 5-10 分钟。两种选择：
+本地 `sentence-transformers` 在 CPU 上确实较慢，1035 篇（约 5.8 万个切块）大概 5-10 分钟。两种选择：
 1. 跳过向量，先把功能跑通：`bash scripts/ingest.sh --no-embed`，传统检索照常工作；
 2. 切线上嵌入：在 `.env` 中把 `EMBED_BACKEND=openai`，并填好 `LLM_API_KEY`，再重跑 ingest。
 
 **Q2. 智能检索报错 "LLM call failed"？**
 
 依次检查：
-- `.env` 中 `LLM_BASE_URL` 与 `LLM_API_KEY` 是否正确（当前用火山方舟 DeepSeek 的 OpenAI 兼容端点；换 DashScope 则用 `https://dashscope.aliyuncs.com/compatible-mode/v1`）；
+- `.env` 中 `LLM_BASE_URL` 与 `LLM_API_KEY` 是否正确（当前用支持 Claude 的 OpenAI 兼容中转端点；换 DashScope 则用 `https://dashscope.aliyuncs.com/compatible-mode/v1`）；
 - Python 侧车日志 `data/storage/py.log`，搜索 `httpx` 或 `Timeout`；
 - 是否能在终端 `curl $LLM_BASE_URL/models -H "Authorization: Bearer $LLM_API_KEY"` 拿到模型列表。
 
