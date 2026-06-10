@@ -33,14 +33,15 @@ type fieldStats struct {
 }
 
 // Index 存储 BM25 所需的统计量与每篇论文的 token 列表。
+// 白名单（Allowed_IDs）不再作为索引状态，而是每次查询的入参，
+// 避免并发请求互相覆盖过滤条件。
 type Index struct {
-	papers      []store.Paper
-	tokens      [][5][]string // 5 = title/keywords/abstract/research_design/body
-	docLen      [][5]int
-	fieldStats  [5]fieldStats
-	docCount    int
-	idx         map[string]int // paper_id -> index
-	allowedMask []bool
+	papers     []store.Paper
+	tokens     [][5][]string // 5 = title/keywords/abstract/research_design/body
+	docLen     [][5]int
+	fieldStats [5]fieldStats
+	docCount   int
+	idx        map[string]int // paper_id -> index
 }
 
 const (
@@ -99,31 +100,31 @@ type Hit struct {
 	Rank          int      `json:"rank"`
 }
 
-// SetAllowed 应用白名单（来自结构化过滤）。
-func (idx *Index) SetAllowed(allowed []string) {
-	if len(allowed) == 0 {
-		idx.allowedMask = nil
-		return
+// allowedMask 把 paper_id 白名单转成下标掩码；allowed 为 nil 表示全放行（返回 nil）。
+func (idx *Index) allowedMask(allowed map[string]bool) []bool {
+	if allowed == nil {
+		return nil
 	}
-	idx.allowedMask = make([]bool, idx.docCount)
-	for _, id := range allowed {
+	mask := make([]bool, idx.docCount)
+	for id := range allowed {
 		if pos, ok := idx.idx[id]; ok {
-			idx.allowedMask[pos] = true
+			mask[pos] = true
 		}
 	}
+	return mask
 }
 
 // AllFields 是全字段激活掩码（title/keywords/abstract/research_design/body）。
 var AllFields = [5]bool{true, true, true, true, true}
 
-// QueryBM25 在所有字段上加权打分。返回降序排列的 Hit 列表。
-func (idx *Index) QueryBM25(query []string, w FieldWeights, topK int) []Hit {
-	return idx.QueryBM25Fields(query, w, AllFields, topK)
+// QueryBM25 在所有字段上加权打分。返回降序排列的 Hit 列表。allowed 为 nil 表示不过滤。
+func (idx *Index) QueryBM25(query []string, w FieldWeights, allowed map[string]bool, topK int) []Hit {
+	return idx.QueryBM25Fields(query, w, AllFields, allowed, topK)
 }
 
 // QueryBM25Fields 与 QueryBM25 相同，但只在 active 指定的字段上打分（用于
 // 字段限定检索：题名 / 关键词 / 摘要 / 主题 / 题名或关键词 等）。
-func (idx *Index) QueryBM25Fields(query []string, w FieldWeights, active [5]bool, topK int) []Hit {
+func (idx *Index) QueryBM25Fields(query []string, w FieldWeights, active [5]bool, allowed map[string]bool, topK int) []Hit {
 	if len(query) == 0 || idx.docCount == 0 {
 		return nil
 	}
@@ -131,6 +132,7 @@ func (idx *Index) QueryBM25Fields(query []string, w FieldWeights, active [5]bool
 	weights := [5]float64{w.Title, w.Keywords, w.Abstract, w.ResearchDesign, w.Body}
 	scores := make([]float64, idx.docCount)
 	matchedFlag := make([][5]bool, idx.docCount)
+	mask := idx.allowedMask(allowed)
 	uniq := uniqueTokens(query)
 	for f := 0; f < 5; f++ {
 		if !active[f] {
@@ -147,7 +149,7 @@ func (idx *Index) QueryBM25Fields(query []string, w FieldWeights, active [5]bool
 			}
 			idf := math.Log(1 + (float64(idx.docCount)-float64(df)+0.5)/(float64(df)+0.5))
 			for i := 0; i < idx.docCount; i++ {
-				if idx.allowedMask != nil && !idx.allowedMask[i] {
+				if mask != nil && !mask[i] {
 					continue
 				}
 				toks := idx.tokens[i][f]

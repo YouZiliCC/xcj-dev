@@ -31,6 +31,33 @@ export type SearchField =
   | "abstract"
   | "doi";
 
+// 知网式硬过滤：同字段多值 OR，字段之间 AND
+export interface SearchFilters {
+  authors?: string[];
+  affiliations?: string[];
+  journals?: string[];
+  clcs?: string[];
+  years?: number[];
+  year_from?: number;
+  year_to?: number;
+  is_core?: boolean;
+}
+
+export interface FacetItem {
+  value: string;
+  count: number;
+}
+
+// 侧边栏聚合：每个过滤字段的候选值 + 命中数（降序）
+export interface Facets {
+  authors: FacetItem[];
+  journals: FacetItem[];
+  years: FacetItem[];
+  core: FacetItem[];
+  clc: FacetItem[];
+  affiliations: FacetItem[];
+}
+
 export interface TraditionalSearchRequest {
   q?: string;
   field?: SearchField;
@@ -38,6 +65,7 @@ export interface TraditionalSearchRequest {
   page?: number;
   page_size?: number;
   sort?: "relevance" | "year";
+  filters?: SearchFilters;
 }
 
 export interface Hit {
@@ -57,6 +85,8 @@ export interface Hit {
 export interface TraditionalSearchResponse {
   hits: Hit[];
   total: number;
+  facets?: Facets;
+  boolean_mode?: boolean;
 }
 
 // ---------------- Smart search ----------------
@@ -77,16 +107,20 @@ export interface SearchPayload {
 
 export interface Rewrite {
   filter_conditions: FilterConditions;
+  boolean_query?: string;
   search_payload: SearchPayload;
 }
 
 export interface SmartSearchRequest {
   q: string;
+  filters?: SearchFilters;
 }
 
 export interface SmartSearchResponse {
   golden: Hit[];
   rewrite: Rewrite;
+  boolean_query?: string;
+  facets?: Facets;
   list_bm25: Hit[];
   list_vector: Hit[];
 }
@@ -122,6 +156,11 @@ export interface Chunk {
   paragraph_index: number;
   offset_start: number;
   chunk_text: string;
+  chapter_title?: string;
+  chapter_index?: number;
+  section_role?: string; // 概念解释/背景说明/方法依据/经验证据/研究空白/其他
+  tag_confidence?: string;
+  split_method?: string;
 }
 
 export interface Paper {
@@ -134,6 +173,9 @@ export interface Paper {
   doi?: string;
   abstract: string;
   keywords: string;
+  core_type?: string;
+  is_core?: number;
+  clc_number?: string;
   research_design_text?: string;
   full_text: string;
   chunks: Chunk[];
@@ -171,7 +213,7 @@ export interface AnalyzeRunResponse {
 // ============================================================
 
 // ---------------- T4 · 智能问答 ----------------
-export interface QaFilters {
+export interface QaFilters extends SearchFilters {
   publish_year?: number;
   author?: string;
   journal?: string;
@@ -180,6 +222,22 @@ export interface QaFilters {
 export interface QaRequest {
   question: string;
   filters?: QaFilters;
+}
+
+// 细粒度文本块引用（五段式回答的 [n] 对应项）
+export interface ChunkCitation {
+  ref_id: number;
+  chunk_id: string;
+  chunk_index: number;
+  paper_id: string;
+  title: string;
+  author: string;
+  year: number;
+  journal: string;
+  doi: string;
+  chapter_title: string;
+  section_role: string;
+  text: string;
 }
 
 export interface Reference {
@@ -235,6 +293,7 @@ export interface ReviewMeta {
 export interface QaMeta {
   evidence_sufficient: boolean;
   references: Reference[];
+  citations?: ChunkCitation[];
 }
 
 export interface ChatMeta {

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from . import db as dbmod
 from . import vector_codec
-from .parser import parse_docx, sliding_chunks
+from .parser import chunk_paper, parse_docx
 from .tokenize_cn import tokenize_join
 
 DEFAULT_DB = "./data/storage/papers.db"
@@ -95,6 +95,14 @@ def _to_int_year(v) -> Optional[int]:
     return None
 
 
+# 核心判定：核心类型字段包含任一核心库标识即视为核心期刊文献
+_CORE_MARKERS = ("北大核心", "CSSCI", "CSCD", "EI", "SCI")
+
+
+def _derive_is_core(core_type: str) -> int:
+    return 1 if any(m in core_type for m in _CORE_MARKERS) else 0
+
+
 def _build_paper_record(
     paper_id: str,
     parsed: Dict[str, Any],
@@ -107,6 +115,8 @@ def _build_paper_record(
     doi = (meta.get("doi") or "").strip()
     source_journal = (meta.get("source_journal") or "").strip()
     affiliation = (meta.get("affiliation") or "").strip()
+    core_type = (meta.get("db_class") or "").strip()
+    clc_number = (meta.get("subject_code") or "").strip()
     publish_year = _to_int_year(meta.get("publish_year"))
     research_design_text = parsed.get("research_design_text") or ""
     raw_body = parsed.get("full_text") or ""
@@ -121,6 +131,9 @@ def _build_paper_record(
         "abstract": abstract,
         "source_journal": source_journal,
         "affiliation": affiliation,
+        "core_type": core_type,
+        "is_core": _derive_is_core(core_type),
+        "clc_number": clc_number,
         "research_design_text": research_design_text,
         "title_tokens": tokenize_join(title),
         "keywords_tokens": tokenize_join(keywords),
@@ -136,6 +149,7 @@ def _process_one(
     csv_idx: Dict[str, Any],
     embedder,
     embed: bool,
+    split_method: str = "semantic",
 ) -> Dict[str, Any]:
     paper_id = _derive_paper_id(docx_path)
     parsed = parse_docx(str(docx_path))
@@ -143,7 +157,9 @@ def _process_one(
     meta = _lookup_meta(csv_idx, paper_id, title_hint=title_hint)
     paper_record = _build_paper_record(paper_id, parsed, meta)
 
-    chunks_meta: List[Dict[str, Any]] = sliding_chunks(parsed.get("full_text") or "")
+    chunks_meta: List[Dict[str, Any]] = chunk_paper(
+        parsed, method=split_method, embedder=embedder if embed else None
+    )
     chunk_records: List[Dict[str, Any]] = []
 
     # 批量计算 embedding
@@ -175,6 +191,11 @@ def _process_one(
                 "paragraph_index": int(ch.get("paragraph_index", -1)),
                 "offset_start": int(ch.get("offset_start", 0)),
                 "chunk_text": ch["chunk_text"],
+                "chapter_title": ch.get("chapter_title", ""),
+                "chapter_index": int(ch.get("chapter_index", -1)),
+                "section_role": ch.get("section_role", ""),
+                "tag_confidence": ch.get("tag_confidence", ""),
+                "split_method": ch.get("split_method", ""),
                 "embedding": emb_blob if emb_blob else None,
             }
         )
@@ -265,8 +286,16 @@ def run(args: argparse.Namespace) -> int:
     failed = 0
     for i, path in enumerate(files, start=1):
         try:
-            result = _process_one(path, csv_idx, embedder, embed=embedder is not None)
+            result = _process_one(
+                path, csv_idx, embedder, embed=embedder is not None,
+                split_method=args.split_method,
+            )
             dbmod.upsert_paper(conn, result["paper"])
+            # 切分方案变化会改变 chunk 数量，先清掉旧 chunk 防止残留
+            conn.execute(
+                "DELETE FROM paper_chunks WHERE paper_id = ?",
+                (result["paper"]["paper_id"],),
+            )
             for ch in result["chunks"]:
                 dbmod.upsert_chunk(conn, ch)
             conn.commit()
@@ -304,6 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-embed", action="store_true", help="跳过嵌入计算")
     p.add_argument("--embed-backend", default=None, help="local 或 openai")
     p.add_argument("--embed-model", default=None, help="嵌入模型名")
+    p.add_argument(
+        "--split-method",
+        default="semantic",
+        choices=["semantic", "greedy", "legacy"],
+        help="切分方法：semantic=语义边界检测(默认) / greedy=段落贪心 / legacy=滑动窗口",
+    )
     return p
 
 

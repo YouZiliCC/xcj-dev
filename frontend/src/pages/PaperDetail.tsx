@@ -172,9 +172,12 @@ export default function PaperDetail() {
                 <div className="mt-3 space-y-2 fade-in">
                   {paper.chunks.map((c, i) => (
                     <div key={c.chunk_id ?? i} className="term-panel px-4 py-3">
-                      <div className="kicker mb-1.5">
-                        §{(c.chunk_index ?? i) + 1}
-                        {c.paragraph_index >= 0 ? ` · ¶${c.paragraph_index}` : ""}
+                      <div className="kicker mb-1.5 flex flex-wrap items-center gap-1.5">
+                        <span>§{(c.chunk_index ?? i) + 1}</span>
+                        {c.chapter_title && <span className="chip">{c.chapter_title}</span>}
+                        {c.section_role && c.section_role !== "其他" && (
+                          <span className="chip chip-violet">{c.section_role}</span>
+                        )}
                       </div>
                       <p className="text-[13px] leading-relaxed text-text-2 whitespace-pre-wrap">
                         {c.chunk_text}

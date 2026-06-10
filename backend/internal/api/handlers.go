@@ -184,13 +184,52 @@ func (h *Handlers) Stats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// searchFilters 知网式硬过滤条件：同一字段多值为 OR，多字段之间为 AND。
+// 兼容旧版 QA 过滤（author/journal/publish_year 单值）。
+type searchFilters struct {
+	Authors      []string `json:"authors"`
+	Affiliations []string `json:"affiliations"`
+	Journals     []string `json:"journals"`
+	CLCs         []string `json:"clcs"`
+	Years        []int    `json:"years"`
+	YearFrom     int      `json:"year_from"`
+	YearTo       int      `json:"year_to"`
+	IsCore       *bool    `json:"is_core"`
+	// 旧版单值字段（QA 页）
+	LegacyAuthor  string `json:"author"`
+	LegacyJournal string `json:"journal"`
+	LegacyYear    int    `json:"publish_year"`
+}
+
+// normalize 把旧版单值字段并入列表字段。
+func (f *searchFilters) normalize() {
+	if f == nil {
+		return
+	}
+	if f.LegacyAuthor != "" {
+		f.Authors = append(f.Authors, f.LegacyAuthor)
+	}
+	if f.LegacyJournal != "" {
+		f.Journals = append(f.Journals, f.LegacyJournal)
+	}
+	if f.LegacyYear > 0 {
+		f.Years = append(f.Years, f.LegacyYear)
+	}
+}
+
+func (f *searchFilters) empty() bool {
+	return f == nil || (len(f.Authors) == 0 && len(f.Affiliations) == 0 && len(f.Journals) == 0 &&
+		len(f.CLCs) == 0 && len(f.Years) == 0 && f.YearFrom == 0 && f.YearTo == 0 && f.IsCore == nil)
+}
+
 type traditionalRequest struct {
-	Q        string `json:"q"`
-	Field    string `json:"field"` // all|theme|title_or_keywords|title|first_author|author|affiliation|keywords|abstract|doi
-	Year     int    `json:"year"`
-	Page     int    `json:"page"`
-	PageSize int    `json:"page_size"`
-	Sort     string `json:"sort"`
+	Q        string         `json:"q"`
+	Field    string         `json:"field"` // all|theme|title_or_keywords|title|first_author|author|affiliation|keywords|abstract|doi
+	Year     int            `json:"year"`
+	Page     int            `json:"page"`
+	PageSize int            `json:"page_size"`
+	Sort     string         `json:"sort"`
+	Filters  *searchFilters `json:"filters"`
 }
 
 type hitView struct {
@@ -276,9 +315,68 @@ func (h *Handlers) toHitViews(hits []search.Hit, papers map[string]store.Paper) 
 	return out
 }
 
-// filterTraditional 按「年份 + 可选元数据列」过滤得到 allowed paper id 列表。
-// 没有任何过滤条件时返回 (nil,true) 表示全放行。metaCol 为空表示不加元数据条件。
-func (h *Handlers) filterTraditional(metaCol, q string, year int) ([]string, bool, error) {
+// likeGroup 生成 (col LIKE ? OR col LIKE ?) 条件组；同字段多值为 OR。
+func likeGroup(col string, values []string, conds *[]string, args *[]any) {
+	var parts []string
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		parts = append(parts, col+" LIKE ?")
+		*args = append(*args, "%"+v+"%")
+	}
+	if len(parts) > 0 {
+		*conds = append(*conds, "("+strings.Join(parts, " OR ")+")")
+	}
+}
+
+// filterConds 把 searchFilters 翻译为 SQL 条件（多字段 AND、同字段多值 OR）。
+func filterConds(f *searchFilters, conds *[]string, args *[]any) {
+	if f == nil {
+		return
+	}
+	likeGroup("author", f.Authors, conds, args)
+	likeGroup("affiliation", f.Affiliations, conds, args)
+	likeGroup("source_journal", f.Journals, conds, args)
+	// 中图分类号：取面板值里 "(" 前的代码做前缀/子串匹配
+	var clcCodes []string
+	for _, c := range f.CLCs {
+		if i := strings.IndexAny(c, "(（"); i > 0 {
+			c = c[:i]
+		}
+		if c = strings.TrimSpace(c); c != "" {
+			clcCodes = append(clcCodes, c)
+		}
+	}
+	likeGroup("clc_number", clcCodes, conds, args)
+	if len(f.Years) > 0 {
+		ph := make([]string, len(f.Years))
+		for i, y := range f.Years {
+			ph[i] = "?"
+			*args = append(*args, y)
+		}
+		*conds = append(*conds, "publish_year IN ("+strings.Join(ph, ",")+")")
+	}
+	if f.YearFrom > 0 {
+		*conds = append(*conds, "publish_year >= ?")
+		*args = append(*args, f.YearFrom)
+	}
+	if f.YearTo > 0 {
+		*conds = append(*conds, "publish_year <= ?")
+		*args = append(*args, f.YearTo)
+	}
+	if f.IsCore != nil {
+		if *f.IsCore {
+			*conds = append(*conds, "is_core = 1")
+		} else {
+			*conds = append(*conds, "COALESCE(is_core,0) = 0")
+		}
+	}
+}
+
+// buildAllowed 执行硬过滤 SQL 得到 Allowed_IDs。无任何条件时返回 (nil,nil,true)。
+func (h *Handlers) buildAllowed(f *searchFilters, metaCol, q string, year int) (map[string]bool, []string, bool, error) {
 	var conds []string
 	var args []any
 	if year > 0 {
@@ -303,24 +401,119 @@ func (h *Handlers) filterTraditional(metaCol, q string, year int) ([]string, boo
 			args = append(args, "%"+q+"%")
 		}
 	}
+	filterConds(f, &conds, &args)
 	if len(conds) == 0 {
-		return nil, true, nil
+		return nil, nil, true, nil
 	}
 	sqlText := "SELECT paper_id FROM papers_master WHERE " + strings.Join(conds, " AND ")
 	rows, err := h.DB.Query(sqlText, args...)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	defer rows.Close()
+	m := map[string]bool{}
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
+		m[id] = true
 		ids = append(ids, id)
 	}
-	return ids, false, rows.Err()
+	return m, ids, false, rows.Err()
+}
+
+// --- 侧边栏聚合（facets）---
+
+type facetItem struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+var authorSplitRe = strings.NewReplacer("；", ";", "，", ";", ",", ";", "、", ";")
+
+func splitAuthors(s string) []string {
+	s = authorSplitRe.Replace(s)
+	var out []string
+	for _, part := range strings.Split(s, ";") {
+		part = strings.TrimSpace(part)
+		// 部分数据用连续空格分隔作者
+		for _, sub := range strings.Fields(part) {
+			if len([]rune(sub)) >= 2 {
+				out = append(out, sub)
+			}
+		}
+	}
+	return out
+}
+
+func topFacet(m map[string]int, n int) []facetItem {
+	items := make([]facetItem, 0, len(m))
+	for v, c := range m {
+		items = append(items, facetItem{Value: v, Count: c})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count != items[j].Count {
+			return items[i].Count > items[j].Count
+		}
+		return items[i].Value < items[j].Value
+	})
+	if len(items) > n {
+		items = items[:n]
+	}
+	return items
+}
+
+// computeFacets 对命中全集（分页前）统计各过滤字段的候选值与数量，按数量降序。
+func computeFacets(hits []search.Hit, papers map[string]store.Paper) map[string][]facetItem {
+	authors := map[string]int{}
+	journals := map[string]int{}
+	years := map[string]int{}
+	core := map[string]int{}
+	clc := map[string]int{}
+	affiliations := map[string]int{}
+	for _, hi := range hits {
+		p, ok := papers[hi.PaperID]
+		if !ok {
+			continue
+		}
+		for _, a := range splitAuthors(p.Author) {
+			authors[a]++
+		}
+		if j := strings.TrimSpace(p.SourceJournal); j != "" {
+			journals[j]++
+		}
+		if p.PublishYear > 0 {
+			years[strconv.Itoa(p.PublishYear)]++
+		}
+		if p.IsCore == 1 {
+			core["核心期刊"]++
+		} else {
+			core["非核心"]++
+		}
+		for _, seg := range strings.FieldsFunc(p.CLCNumber, func(r rune) bool { return r == ';' || r == '；' }) {
+			if seg = strings.TrimSpace(seg); seg != "" {
+				clc[seg]++
+			}
+		}
+		if aff := strings.TrimSpace(p.Affiliation); aff != "" {
+			first := strings.FieldsFunc(aff, func(r rune) bool {
+				return r == ';' || r == '；' || r == ',' || r == '，'
+			})
+			if len(first) > 0 && strings.TrimSpace(first[0]) != "" {
+				affiliations[strings.TrimSpace(first[0])]++
+			}
+		}
+	}
+	return map[string][]facetItem{
+		"authors":      topFacet(authors, 15),
+		"journals":     topFacet(journals, 15),
+		"years":        topFacet(years, 20),
+		"core":         topFacet(core, 2),
+		"clc":          topFacet(clc, 15),
+		"affiliations": topFacet(affiliations, 15),
+	}
 }
 
 func (h *Handlers) SearchTraditional(w http.ResponseWriter, r *http.Request) {
@@ -341,27 +534,35 @@ func (h *Handlers) SearchTraditional(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.Filters.normalize()
 	active, isText, metaCol := fieldPlan(req.Field)
-	allowedIDs, all, err := h.filterTraditional(metaCol, req.Q, req.Year)
+	allowedMap, allowedIDs, all, err := h.buildAllowed(req.Filters, metaCol, req.Q, req.Year)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "filter: "+err.Error())
 		return
 	}
 
 	var hits []search.Hit
+	var boolQueryUsed bool
 	if isText {
-		// 文本字段：BM25（按字段掩码）。年份过滤通过白名单实现。
-		if !all {
-			idx.SetAllowed(allowedIDs)
-		} else {
-			idx.SetAllowed(nil)
+		q := strings.TrimSpace(req.Q)
+		// 布尔表达式：AND/OR/NOT/括号/"短语"/字段限定。解析失败回退普通 BM25。
+		if q != "" && search.LooksBoolean(q) {
+			if bh, berr := idx.BoolSearch(q, search.DefaultFieldWeights(), active, allowedMap, 500); berr == nil {
+				hits = bh
+				boolQueryUsed = true
+			} else {
+				log.Printf("[traditional] bool parse failed, fallback: %v", berr)
+			}
 		}
-		tokens := search.Tokenize(req.Q)
-		if len(tokens) > 0 {
-			hits = idx.QueryBM25Fields(tokens, search.DefaultFieldWeights(), active, 200)
-		} else if !all {
-			// 无关键词但有年份过滤：返回过滤后的论文
-			hits = idsToHits(allowedIDs)
+		if !boolQueryUsed {
+			tokens := search.Tokenize(q)
+			if len(tokens) > 0 {
+				hits = idx.QueryBM25Fields(tokens, search.DefaultFieldWeights(), active, allowedMap, 500)
+			} else if !all {
+				// 无关键词但有过滤条件：返回过滤后的论文
+				hits = idsToHits(allowedIDs)
+			}
 		}
 	} else {
 		// 元数据字段（作者/第一作者/作者单位/DOI）：SQL 过滤结果即检索结果。
@@ -378,6 +579,7 @@ func (h *Handlers) SearchTraditional(w http.ResponseWriter, r *http.Request) {
 			hits[i].Rank = i + 1
 		}
 	}
+	facets := computeFacets(hits, papers)
 	total := len(hits)
 	start := (req.Page - 1) * req.PageSize
 	end := start + req.PageSize
@@ -391,7 +593,7 @@ func (h *Handlers) SearchTraditional(w http.ResponseWriter, r *http.Request) {
 	views := h.toHitViews(page, papers)
 
 	filters, _ := json.Marshal(map[string]any{
-		"field": req.Field, "year": req.Year,
+		"field": req.Field, "year": req.Year, "filters": req.Filters,
 		"page": req.Page, "page_size": req.PageSize, "sort": req.Sort,
 	})
 	if err := h.DB.AddHistory("traditional", req.Q, string(filters)); err != nil {
@@ -399,13 +601,16 @@ func (h *Handlers) SearchTraditional(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"hits":  views,
-		"total": total,
+		"hits":         views,
+		"total":        total,
+		"facets":       facets,
+		"boolean_mode": boolQueryUsed,
 	})
 }
 
 type smartRequest struct {
-	Q string `json:"q"`
+	Q       string         `json:"q"`
+	Filters *searchFilters `json:"filters"`
 }
 
 func collectStrings(v any) []string {
@@ -427,76 +632,66 @@ func collectStrings(v any) []string {
 	return nil
 }
 
-// applyFilterConditions 把 LLM 给的过滤条件应用到 papers，得到 allowed paper_id 列表与是否全放行。
-func (h *Handlers) applyFilterConditions(fc map[string]any) (map[string]bool, []string, bool) {
+func collectInt(v any) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// filtersFromConditions 把 LLM rewrite 输出的 filter_conditions 归一化为 searchFilters。
+// 支持的键：authors/author、affiliation、journal/source_journal、is_core、
+// clc_number/clc、publish_year（数值或列表）、year_from、year_to。
+func filtersFromConditions(fc map[string]any) *searchFilters {
 	if len(fc) == 0 {
-		return nil, nil, true
+		return nil
 	}
-	yearList := collectStrings(fc["publish_year"])
-	authorList := collectStrings(fc["author"])
-	journalList := collectStrings(fc["journal"])
-	if v, ok := fc["source_journal"]; ok {
-		journalList = append(journalList, collectStrings(v)...)
-	}
-	var years []int
-	for _, y := range yearList {
+	f := &searchFilters{}
+	f.Authors = append(collectStrings(fc["authors"]), collectStrings(fc["author"])...)
+	f.Affiliations = collectStrings(fc["affiliation"])
+	f.Journals = append(collectStrings(fc["journal"]), collectStrings(fc["source_journal"])...)
+	f.CLCs = append(collectStrings(fc["clc_number"]), collectStrings(fc["clc"])...)
+	for _, y := range collectStrings(fc["publish_year"]) {
 		if n, err := strconv.Atoi(strings.TrimSpace(y)); err == nil {
-			years = append(years, n)
+			f.Years = append(f.Years, n)
 		}
 	}
-	// 数字形式
-	if y, ok := fc["publish_year"].(float64); ok {
-		years = append(years, int(y))
+	if y := collectInt(fc["publish_year"]); y > 0 {
+		f.Years = append(f.Years, y)
 	}
-	if len(years) == 0 && len(authorList) == 0 && len(journalList) == 0 {
+	f.YearFrom = collectInt(fc["year_from"])
+	f.YearTo = collectInt(fc["year_to"])
+	if b, ok := fc["is_core"].(bool); ok {
+		f.IsCore = &b
+	}
+	if f.empty() {
+		return nil
+	}
+	return f
+}
+
+// applyFilterConditions 把 LLM 给的过滤条件应用到 papers，得到 allowed paper_id 集合与是否全放行。
+// LLM 条件过严导致空集时回退为全量放行（fallback_to_all），避免幻觉过滤把整榜清空。
+func (h *Handlers) applyFilterConditions(fc map[string]any) (map[string]bool, []string, bool) {
+	f := filtersFromConditions(fc)
+	if f == nil {
 		return nil, nil, true
 	}
-	var conds []string
-	var args []any
-	if len(years) > 0 {
-		placeholders := make([]string, len(years))
-		for i, y := range years {
-			placeholders[i] = "?"
-			args = append(args, y)
-		}
-		conds = append(conds, "publish_year IN ("+strings.Join(placeholders, ",")+")")
-	}
-	if len(authorList) > 0 {
-		var parts []string
-		for _, a := range authorList {
-			parts = append(parts, "author LIKE ?")
-			args = append(args, "%"+a+"%")
-		}
-		conds = append(conds, "("+strings.Join(parts, " OR ")+")")
-	}
-	if len(journalList) > 0 {
-		var parts []string
-		for _, j := range journalList {
-			parts = append(parts, "source_journal LIKE ?")
-			args = append(args, "%"+j+"%")
-		}
-		conds = append(conds, "("+strings.Join(parts, " OR ")+")")
-	}
-	if len(conds) == 0 {
-		return nil, nil, true
-	}
-	q := "SELECT paper_id FROM papers_master WHERE " + strings.Join(conds, " AND ")
-	rows, err := h.DB.Query(q, args...)
+	m, ids, all, err := h.buildAllowed(f, "", "", 0)
 	if err != nil {
 		log.Printf("[smart] filter sql error: %v", err)
 		return nil, nil, true
 	}
-	defer rows.Close()
-	m := map[string]bool{}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			m[id] = true
-			ids = append(ids, id)
-		}
+	if !all && len(ids) == 0 {
+		log.Printf("[smart] llm filter matched nothing, fallback to all: %+v", fc)
+		return nil, nil, true
 	}
-	return m, ids, false
+	return m, ids, all
 }
 
 // smartRetrieval 是一次智能检索（rewrite→BM25∪向量→RRF）的产物。
@@ -530,7 +725,8 @@ func sharedMeaningfulToken(a, b []string) bool {
 }
 
 // runSmartRetrieval 复用 SearchSmart 的"rewrite→BM25∪向量→RRF 得 golden"逻辑，供 smart/qa/review-auto 复用。
-func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetrieval, error) {
+// userFilters 是用户在前端显式选择的硬过滤（与 LLM 提取的过滤条件取交集）。
+func (h *Handlers) runSmartRetrieval(ctx context.Context, q string, userFilters *searchFilters) (*smartRetrieval, error) {
 	idx, chunks, _ := h.snapshot()
 	if idx == nil {
 		return nil, fmt.Errorf("index not ready")
@@ -553,17 +749,35 @@ func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetri
 		}
 	}
 
-	// 过滤
+	// 过滤：LLM 提取的条件 ∩ 用户显式选择的条件
 	var allowedMap map[string]bool
-	var allowedIDs []string
 	allAllowed := true
 	if rewrite != nil {
-		allowedMap, allowedIDs, allAllowed = h.applyFilterConditions(rewrite.FilterConditions)
+		allowedMap, _, allAllowed = h.applyFilterConditions(rewrite.FilterConditions)
+	}
+	if !userFilters.empty() {
+		userFilters.normalize()
+		uMap, _, uAll, ferr := h.buildAllowed(userFilters, "", "", 0)
+		if ferr != nil {
+			return nil, fmt.Errorf("filter: %w", ferr)
+		}
+		if !uAll {
+			if allAllowed {
+				allowedMap = uMap
+				allAllowed = false
+			} else {
+				merged := map[string]bool{}
+				for id := range allowedMap {
+					if uMap[id] {
+						merged[id] = true
+					}
+				}
+				allowedMap = merged
+			}
+		}
 	}
 	if allAllowed {
-		idx.SetAllowed(nil)
-	} else {
-		idx.SetAllowed(allowedIDs)
+		allowedMap = nil
 	}
 
 	// 关键词聚合：仅用 学术关键词 + 近义扩展，并始终保留原始查询作为锚点。
@@ -576,7 +790,7 @@ func (h *Handlers) runSmartRetrieval(ctx context.Context, q string) (*smartRetri
 	}
 	kwParts = append(kwParts, q)
 	tokens := search.Tokenize(strings.Join(kwParts, " "))
-	listA := idx.QueryBM25(tokens, search.DefaultFieldWeights(), 200)
+	listA := idx.QueryBM25(tokens, search.DefaultFieldWeights(), allowedMap, 200)
 
 	// 向量：设相似度下限 smartVectorFloor，过滤弱相关 chunk（提高查准率）。
 	var listB []search.Hit
@@ -614,14 +828,14 @@ func (h *Handlers) SearchSmart(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	res, err := h.runSmartRetrieval(ctx, q)
+	res, err := h.runSmartRetrieval(ctx, q, req.Filters)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
 	// 写历史
-	filtersJSON, _ := json.Marshal(map[string]any{"rewrite": res.Rewrite != nil})
+	filtersJSON, _ := json.Marshal(map[string]any{"rewrite": res.Rewrite != nil, "filters": req.Filters})
 	if err := h.DB.AddHistory("smart", q, string(filtersJSON)); err != nil {
 		log.Printf("[history] add: %v", err)
 	}
@@ -633,11 +847,17 @@ func (h *Handlers) SearchSmart(w http.ResponseWriter, r *http.Request) {
 		return hits
 	}
 
+	boolQuery := ""
+	if res.Rewrite != nil {
+		boolQuery = res.Rewrite.BooleanQuery
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"golden":      h.toHitViews(res.Golden, papers),
-		"rewrite":     res.Rewrite,
-		"list_bm25":   h.toHitViews(trim(res.ListBM25, 50), papers),
-		"list_vector": h.toHitViews(trim(res.ListVector, 50), papers),
+		"golden":        h.toHitViews(res.Golden, papers),
+		"rewrite":       res.Rewrite,
+		"boolean_query": boolQuery,
+		"facets":        computeFacets(res.Golden, papers),
+		"list_bm25":     h.toHitViews(trim(res.ListBM25, 50), papers),
+		"list_vector":   h.toHitViews(trim(res.ListVector, 50), papers),
 	})
 }
 
@@ -646,13 +866,18 @@ type generateRequest struct {
 	PaperIDs []string `json:"paper_ids"`
 }
 
-// buildGeneratePapers 按 paper_ids 取每篇最高分 chunk 组装 GeneratePaper。
+// buildGeneratePapers 按 paper_ids 取每篇最相关的若干 chunk 组装 GeneratePaper。
 // 用 q 的嵌入向量挑最相关 chunk；若 Python 嵌入不可用则优雅降级为最长 chunk。
-// topN<=0 表示不截断。
-func (h *Handlers) buildGeneratePapers(ctx context.Context, q string, paperIDs []string, topN int) []pyclient.GeneratePaper {
+// topN<=0 表示不截断；chunksPer 为每篇选取的 chunk 数（>=2 时填充 Chunks 并赋全局引用编号，
+// 供 QA 细粒度引用；=1 时仅填 TopChunkText，保持综述路径行为不变）。
+// section_role 为「其他」的 chunk（参考文献/致谢/附录）不参与取证。
+func (h *Handlers) buildGeneratePapers(ctx context.Context, q string, paperIDs []string, topN, chunksPer int) []pyclient.GeneratePaper {
 	ids := paperIDs
 	if topN > 0 && len(ids) > topN {
 		ids = ids[:topN]
+	}
+	if chunksPer <= 0 {
+		chunksPer = 1
 	}
 
 	var qVec []float32
@@ -665,6 +890,7 @@ func (h *Handlers) buildGeneratePapers(ctx context.Context, q string, paperIDs [
 
 	_, _, papersMap := h.snapshot()
 	genPapers := make([]pyclient.GeneratePaper, 0, len(ids))
+	refID := 0
 	for _, id := range ids {
 		p, ok := papersMap[id]
 		if !ok {
@@ -675,26 +901,32 @@ func (h *Handlers) buildGeneratePapers(ctx context.Context, q string, paperIDs [
 			p = *pp
 		}
 		chunks, _ := h.DB.ChunksByPaper(id)
-		bestScore := 0.0
-		bestText := ""
+		type scored struct {
+			c store.Chunk
+			s float64
+		}
+		var cand []scored
+		for _, c := range chunks {
+			if c.SectionRole == "其他" {
+				continue
+			}
+			s := 0.0
+			if len(qVec) > 0 {
+				s = search.Cosine(c.Embedding, qVec)
+			}
+			cand = append(cand, scored{c: c, s: s})
+		}
 		if len(qVec) > 0 {
-			for _, c := range chunks {
-				s := search.Cosine(c.Embedding, qVec)
-				if s > bestScore {
-					bestScore = s
-					bestText = c.ChunkText
-				}
-			}
+			sort.SliceStable(cand, func(i, j int) bool { return cand[i].s > cand[j].s })
+		} else {
+			// 嵌入不可用：按 chunk 长度降级排序
+			sort.SliceStable(cand, func(i, j int) bool { return len(cand[i].c.ChunkText) > len(cand[j].c.ChunkText) })
 		}
-		if bestText == "" {
-			// fallback：取最长的 chunk
-			for _, c := range chunks {
-				if len(c.ChunkText) > len(bestText) {
-					bestText = c.ChunkText
-				}
-			}
+		if len(cand) > chunksPer {
+			cand = cand[:chunksPer]
 		}
-		genPapers = append(genPapers, pyclient.GeneratePaper{
+
+		gp := pyclient.GeneratePaper{
 			PaperID:            p.PaperID,
 			Title:              p.Title,
 			DOI:                p.DOI,
@@ -702,12 +934,54 @@ func (h *Handlers) buildGeneratePapers(ctx context.Context, q string, paperIDs [
 			Keywords:           p.Keywords,
 			Abstract:           p.Abstract,
 			PublishYear:        p.PublishYear,
+			Journal:            p.SourceJournal,
 			ResearchDesignText: p.ResearchDesignText,
-			TopChunkText:       bestText,
-			RelevanceScore:     bestScore,
-		})
+		}
+		if len(cand) > 0 {
+			gp.TopChunkText = cand[0].c.ChunkText
+			gp.RelevanceScore = cand[0].s
+		}
+		if chunksPer >= 2 {
+			for _, sc := range cand {
+				refID++
+				gp.Chunks = append(gp.Chunks, pyclient.GenChunk{
+					RefID:        refID,
+					ChunkID:      sc.c.ChunkID,
+					ChunkIndex:   sc.c.ChunkIndex,
+					Text:         sc.c.ChunkText,
+					SectionRole:  sc.c.SectionRole,
+					ChapterTitle: sc.c.ChapterTitle,
+					Score:        sc.s,
+				})
+			}
+		}
+		genPapers = append(genPapers, gp)
 	}
 	return genPapers
+}
+
+// chunkCitations 把 GeneratePaper 里的取证 chunk 平铺成细粒度引用列表（含全局编号）。
+func chunkCitations(genPapers []pyclient.GeneratePaper) []map[string]any {
+	var out []map[string]any
+	for _, p := range genPapers {
+		for _, c := range p.Chunks {
+			out = append(out, map[string]any{
+				"ref_id":        c.RefID,
+				"chunk_id":      c.ChunkID,
+				"chunk_index":   c.ChunkIndex,
+				"paper_id":      p.PaperID,
+				"title":         p.Title,
+				"author":        p.Author,
+				"year":          p.PublishYear,
+				"journal":       p.Journal,
+				"doi":           p.DOI,
+				"chapter_title": c.ChapterTitle,
+				"section_role":  c.SectionRole,
+				"text":          c.Text,
+			})
+		}
+	}
+	return out
 }
 
 // citationsFromGenPapers 把 GeneratePaper 数组组装成 citations（同 /analyze/generate）。
@@ -743,7 +1017,7 @@ func (h *Handlers) AnalyzeGenerate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	genPapers := h.buildGeneratePapers(ctx, req.Q, req.PaperIDs, 5)
+	genPapers := h.buildGeneratePapers(ctx, req.Q, req.PaperIDs, 5, 1)
 
 	resp, err := h.Py.Generate(ctx, pyclient.GenerateRequest{Query: req.Q, Papers: genPapers})
 	if err != nil {
@@ -779,22 +1053,9 @@ func (h *Handlers) GetPaper(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	type chunkView struct {
-		ChunkID        string `json:"chunk_id"`
-		ChunkIndex     int    `json:"chunk_index"`
-		ParagraphIndex int    `json:"paragraph_index"`
-		OffsetStart    int    `json:"offset_start"`
-		ChunkText      string `json:"chunk_text"`
-	}
 	cvs := make([]chunkView, 0, len(chunks))
 	for _, c := range chunks {
-		cvs = append(cvs, chunkView{
-			ChunkID:        c.ChunkID,
-			ChunkIndex:     c.ChunkIndex,
-			ParagraphIndex: c.ParagraphIndex,
-			OffsetStart:    c.OffsetStart,
-			ChunkText:      c.ChunkText,
-		})
+		cvs = append(cvs, toChunkView(c, 0))
 	}
 	// 把 paper 字段平铺，便于前端 typed 客户端按平面结构消费。
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -807,10 +1068,44 @@ func (h *Handlers) GetPaper(w http.ResponseWriter, r *http.Request) {
 		"abstract":             p.Abstract,
 		"source_journal":       p.SourceJournal,
 		"affiliation":          p.Affiliation,
+		"core_type":            p.CoreType,
+		"is_core":              p.IsCore,
+		"clc_number":           p.CLCNumber,
 		"research_design_text": p.ResearchDesignText,
 		"full_text":            p.RawBody,
 		"chunks":               cvs,
 	})
+}
+
+// chunkView 是 chunk 的对外视图（详情页 / 按语义排序接口共用）。
+type chunkView struct {
+	ChunkID        string  `json:"chunk_id"`
+	ChunkIndex     int     `json:"chunk_index"`
+	ParagraphIndex int     `json:"paragraph_index"`
+	OffsetStart    int     `json:"offset_start"`
+	ChunkText      string  `json:"chunk_text"`
+	ChapterTitle   string  `json:"chapter_title"`
+	ChapterIndex   int     `json:"chapter_index"`
+	SectionRole    string  `json:"section_role"`
+	TagConfidence  string  `json:"tag_confidence"`
+	SplitMethod    string  `json:"split_method"`
+	Score          float64 `json:"score,omitempty"`
+}
+
+func toChunkView(c store.Chunk, score float64) chunkView {
+	return chunkView{
+		ChunkID:        c.ChunkID,
+		ChunkIndex:     c.ChunkIndex,
+		ParagraphIndex: c.ParagraphIndex,
+		OffsetStart:    c.OffsetStart,
+		ChunkText:      c.ChunkText,
+		ChapterTitle:   c.ChapterTitle,
+		ChapterIndex:   c.ChapterIndex,
+		SectionRole:    c.SectionRole,
+		TagConfidence:  c.TagConfidence,
+		SplitMethod:    c.SplitMethod,
+		Score:          score,
+	}
 }
 
 func (h *Handlers) GetPaperChunks(w http.ResponseWriter, r *http.Request) {
@@ -821,22 +1116,11 @@ func (h *Handlers) GetPaperChunks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	type chunkView struct {
-		ChunkID        string  `json:"chunk_id"`
-		ChunkIndex     int     `json:"chunk_index"`
-		ParagraphIndex int     `json:"paragraph_index"`
-		OffsetStart    int     `json:"offset_start"`
-		ChunkText      string  `json:"chunk_text"`
-		Score          float64 `json:"score,omitempty"`
-	}
 	if q == "" {
 		sort.Slice(chunks, func(i, j int) bool { return chunks[i].ChunkIndex < chunks[j].ChunkIndex })
 		out := make([]chunkView, 0, len(chunks))
 		for _, c := range chunks {
-			out = append(out, chunkView{
-				ChunkID: c.ChunkID, ChunkIndex: c.ChunkIndex,
-				ParagraphIndex: c.ParagraphIndex, OffsetStart: c.OffsetStart, ChunkText: c.ChunkText,
-			})
+			out = append(out, toChunkView(c, 0))
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"chunks": out})
 		return
@@ -860,11 +1144,7 @@ func (h *Handlers) GetPaperChunks(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(arr, func(i, j int) bool { return arr[i].s > arr[j].s })
 	out := make([]chunkView, 0, len(arr))
 	for _, x := range arr {
-		out = append(out, chunkView{
-			ChunkID: x.c.ChunkID, ChunkIndex: x.c.ChunkIndex,
-			ParagraphIndex: x.c.ParagraphIndex, OffsetStart: x.c.OffsetStart,
-			ChunkText: x.c.ChunkText, Score: x.s,
-		})
+		out = append(out, toChunkView(x.c, x.s))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"chunks": out})
 }
@@ -911,15 +1191,9 @@ func (h *Handlers) AnalyzeRun(w http.ResponseWriter, r *http.Request) {
 
 // --- T4/T3/T5 学术智能体 ---
 
-type qaFilters struct {
-	PublishYear int    `json:"publish_year"`
-	Author      string `json:"author"`
-	Journal     string `json:"journal"`
-}
-
 type qaRequest struct {
-	Question string     `json:"question"`
-	Filters  *qaFilters `json:"filters"`
+	Question string         `json:"question"`
+	Filters  *searchFilters `json:"filters"`
 }
 
 // matchedBy 依据该 paper 是否出现在 BM25 / 向量列表中判定命中方式。
@@ -961,7 +1235,7 @@ func (h *Handlers) QAAnswer(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	res, err := h.runSmartRetrieval(ctx, q)
+	res, err := h.runSmartRetrieval(ctx, q, req.Filters)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -987,7 +1261,9 @@ func (h *Handlers) QAAnswer(w http.ResponseWriter, r *http.Request) {
 	for _, hi := range selected {
 		ids = append(ids, hi.PaperID)
 	}
-	genPapers := h.buildGeneratePapers(ctx, q, ids, 0)
+	// 每篇取 3 个最相关 chunk，并赋全局引用编号，支撑五段式回答的细粒度引用。
+	genPapers := h.buildGeneratePapers(ctx, q, ids, 0, 3)
+	citations := chunkCitations(genPapers)
 
 	bmSet := idSet(res.ListBM25)
 	vecSet := idSet(res.ListVector)
@@ -1004,7 +1280,7 @@ func (h *Handlers) QAAnswer(w http.ResponseWriter, r *http.Request) {
 			"author":     p.Author,
 			"year":       p.PublishYear,
 			"doi":        p.DOI,
-			"journal":    "",
+			"journal":    p.Journal,
 			"matched_by": matchedBy(p.PaperID, bmSet, vecSet),
 			"score":      scoreByID[p.PaperID],
 			"snippet":    p.TopChunkText,
@@ -1024,11 +1300,12 @@ func (h *Handlers) QAAnswer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"answer": answer, "evidence_sufficient": evidenceSufficient, "references": references,
+			"answer": answer, "evidence_sufficient": evidenceSufficient,
+			"references": references, "citations": citations,
 		})
 		return
 	}
-	send("meta", map[string]any{"evidence_sufficient": evidenceSufficient, "references": references})
+	send("meta", map[string]any{"evidence_sufficient": evidenceSufficient, "references": references, "citations": citations})
 	if err := h.Py.QAStream(ctx, q, genPapers, evidenceSufficient, func(d string) {
 		send("delta", map[string]any{"text": d})
 	}); err != nil {
@@ -1056,7 +1333,7 @@ func (h *Handlers) ReviewAuto(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	res, err := h.runSmartRetrieval(ctx, q)
+	res, err := h.runSmartRetrieval(ctx, q, nil)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -1069,7 +1346,7 @@ func (h *Handlers) ReviewAuto(w http.ResponseWriter, r *http.Request) {
 	for _, hi := range hits {
 		ids = append(ids, hi.PaperID)
 	}
-	genPapers := h.buildGeneratePapers(ctx, q, ids, 0)
+	genPapers := h.buildGeneratePapers(ctx, q, ids, 0, 1)
 	citations := citationsFromGenPapers(genPapers)
 
 	send, ok := sseStart(w)
@@ -1156,7 +1433,7 @@ func (h *Handlers) ReviewManual(w http.ResponseWriter, r *http.Request) {
 		if query == "" {
 			query = found.Title
 		}
-		genPapers = h.buildGeneratePapers(ctx, query, []string{found.PaperID}, 0)
+		genPapers = h.buildGeneratePapers(ctx, query, []string{found.PaperID}, 0, 1)
 		matched = map[string]any{"paper_id": found.PaperID, "title": found.Title}
 	}
 
@@ -1319,9 +1596,8 @@ func (h *Handlers) PaperRelated(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// BM25 路：用该论文 keywords 分词全量检索。
-	idx.SetAllowed(nil)
 	seedTokens := search.Tokenize(seed.Keywords)
-	listA := idx.QueryBM25(seedTokens, search.DefaultFieldWeights(), 50)
+	listA := idx.QueryBM25(seedTokens, search.DefaultFieldWeights(), nil, 50)
 
 	// 向量路：取该论文自己最长的 chunk 的 embedding 作为种子向量。
 	var listB []search.Hit

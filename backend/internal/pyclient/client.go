@@ -145,6 +145,7 @@ func (c *Client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 
 type RewriteResult struct {
 	FilterConditions map[string]any `json:"filter_conditions"`
+	BooleanQuery     string         `json:"boolean_query"`
 	SearchPayload    struct {
 		CoreSemanticSentence  string   `json:"core_semantic_sentence"`
 		AcademicKeywords      []string `json:"academic_keywords"`
@@ -164,17 +165,30 @@ func (c *Client) Rewrite(ctx context.Context, query string) (*RewriteResult, err
 	return &resp, nil
 }
 
+// GenChunk 是带全局引用编号的取证文本块（QA 五段式细粒度引用用）。
+type GenChunk struct {
+	RefID        int     `json:"ref_id"`
+	ChunkID      string  `json:"chunk_id"`
+	ChunkIndex   int     `json:"chunk_index"`
+	Text         string  `json:"text"`
+	SectionRole  string  `json:"section_role"`
+	ChapterTitle string  `json:"chapter_title"`
+	Score        float64 `json:"score"`
+}
+
 type GeneratePaper struct {
-	PaperID            string  `json:"paper_id"`
-	Title              string  `json:"title"`
-	DOI                string  `json:"doi"`
-	Author             string  `json:"author"`
-	Keywords           string  `json:"keywords"`
-	Abstract           string  `json:"abstract"`
-	PublishYear        int     `json:"publish_year"`
-	ResearchDesignText string  `json:"research_design_text"`
-	TopChunkText       string  `json:"top_chunk_text"`
-	RelevanceScore     float64 `json:"relevance_score"`
+	PaperID            string     `json:"paper_id"`
+	Title              string     `json:"title"`
+	DOI                string     `json:"doi"`
+	Author             string     `json:"author"`
+	Keywords           string     `json:"keywords"`
+	Abstract           string     `json:"abstract"`
+	PublishYear        int        `json:"publish_year"`
+	Journal            string     `json:"journal"`
+	ResearchDesignText string     `json:"research_design_text"`
+	TopChunkText       string     `json:"top_chunk_text"`
+	RelevanceScore     float64    `json:"relevance_score"`
+	Chunks             []GenChunk `json:"chunks,omitempty"`
 }
 
 type GenerateRequest struct {

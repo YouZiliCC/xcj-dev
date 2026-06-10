@@ -71,6 +71,18 @@ class RewriteRequest(BaseModel):
     q: str
 
 
+class GenChunk(BaseModel):
+    """带全局引用编号的取证文本块（QA 五段式细粒度引用）。"""
+
+    ref_id: int = 0
+    chunk_id: str = ""
+    chunk_index: int = 0
+    text: str = ""
+    section_role: str = ""
+    chapter_title: str = ""
+    score: float = 0.0
+
+
 class GeneratePaper(BaseModel):
     paper_id: str = ""
     title: str = ""
@@ -79,9 +91,11 @@ class GeneratePaper(BaseModel):
     keywords: str = ""
     abstract: str = ""
     publish_year: Optional[int] = None
+    journal: str = ""
     research_design_text: str = ""
     top_chunk_text: str = ""
     relevance_score: float = 0.0
+    chunks: List[GenChunk] = Field(default_factory=list)
 
 
 class GenerateRequest(BaseModel):
@@ -129,7 +143,17 @@ _REWRITE_SYSTEM = (
     "不要使用 markdown 代码块。\n"
     "返回结构：\n"
     "{\n"
-    '  "filter_conditions": { "publish_year": 整数或 null },\n'
+    '  "filter_conditions": {\n'
+    '    "publish_year": 整数或 null,\n'
+    '    "year_from": 整数或 null,\n'
+    '    "year_to": 整数或 null,\n'
+    '    "authors": [字符串...],\n'
+    '    "affiliation": [字符串...],\n'
+    '    "journal": [字符串...],\n'
+    '    "is_core": true/false/null,\n'
+    '    "clc_number": [字符串...]\n'
+    "  },\n"
+    '  "boolean_query": 字符串,\n'
     '  "search_payload": {\n'
     '    "core_semantic_sentence": 字符串,\n'
     '    "academic_keywords": [字符串...],\n'
@@ -139,6 +163,13 @@ _REWRITE_SYSTEM = (
     "  }\n"
     "}\n"
     "规则：\n"
+    "- filter_conditions 只在用户问题中【显式提到】对应条件时才填：提到作者填 authors、"
+    "提到单位/学校填 affiliation、提到期刊填 journal、明确要求核心期刊填 is_core=true、"
+    "提到中图分类号填 clc_number、提到年份填 publish_year（单年）或 year_from/year_to（区间）。"
+    "未提到的字段一律为 null 或 []，严禁臆测。\n"
+    "- boolean_query：把核心检索词组织成布尔检索式，同义词/近义词用 OR 并用括号分组，"
+    '不同概念之间用 AND，需要排除的主题用 NOT，例如 "(深度学习 OR 机器学习) AND (图像分类 OR 目标检测) NOT 综述"。'
+    "没有排除需求就不要用 NOT。\n"
     "- 如果用户没指定年份则 publish_year 为 null。\n"
     "- 如果没有明确的方法/模型/算法/实验设计意图，research_design_terms 必须为 []。\n"
     "- 关键词列表不要包含停用词，去重，使用中文学术词。"
@@ -172,6 +203,7 @@ def _fallback_rewrite(q: str) -> Dict[str, Any]:
                 keywords.append(t)
     return {
         "filter_conditions": {"publish_year": year},
+        "boolean_query": "",
         "search_payload": {
             "core_semantic_sentence": q or "",
             "academic_keywords": keywords[:12],
@@ -222,8 +254,28 @@ def _normalize_rewrite(raw: Dict[str, Any], q: str) -> Dict[str, Any]:
             return [str(x).strip() for x in v if str(x).strip()]
         return []
 
+    def _as_int(v) -> Optional[int]:
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            m = _YEAR_RE.search(v)
+            return int(m.group(0)) if m else None
+        return None
+
+    conditions: Dict[str, Any] = {
+        "publish_year": publish_year,
+        "year_from": _as_int(filt.get("year_from")),
+        "year_to": _as_int(filt.get("year_to")),
+        "authors": _as_list(filt.get("authors") or filt.get("author")),
+        "affiliation": _as_list(filt.get("affiliation")),
+        "journal": _as_list(filt.get("journal") or filt.get("source_journal")),
+        "is_core": filt.get("is_core") if isinstance(filt.get("is_core"), bool) else None,
+        "clc_number": _as_list(filt.get("clc_number") or filt.get("clc")),
+    }
+
     return {
-        "filter_conditions": {"publish_year": publish_year},
+        "filter_conditions": conditions,
+        "boolean_query": str(raw.get("boolean_query") or "").strip(),
         "search_payload": {
             "core_semantic_sentence": str(payload.get("core_semantic_sentence") or q or "").strip(),
             "academic_keywords": _as_list(payload.get("academic_keywords"))
@@ -522,13 +574,27 @@ def _ndjson_stream(messages: List[Dict[str, str]], cfg: Dict[str, Any],
 
 
 _QA_SYSTEM = (
-    "你是学术问答助手，只能基于下方提供的文献证据回答用户问题。\n"
-    "这不是写综述或研究报告，请直接、简洁地回答用户的问题。\n"
+    "你是学术研究问答助手，只能基于下方提供的带编号文献证据回答用户问题。\n"
+    "必须严格按以下五段固定结构输出（Markdown 二级标题，顺序不得调换、不得缺失任何一段）：\n"
+    "## 概念解释\n"
+    "（定义问题涉及的核心概念、指标或理论，约 80-150 字）\n"
+    "## 背景说明\n"
+    "（说明问题背景与研究动因，约 80-150 字）\n"
+    "## 方法依据\n"
+    "（说明相关方法、模型、算法或实验设计，约 80-200 字）\n"
+    "## 经验证据\n"
+    "（给出数据、实验或案例结果，约 80-200 字）\n"
+    "## 研究空白\n"
+    "（指出现有研究不足与未来方向，约 60-120 字）\n"
     "硬性规则：\n"
-    "1. 只能依据提供的【证据N】作答，严禁编造证据之外的事实。\n"
-    "2. 每个关键论断后必须用 [DOI:xxx] 或 [标题] 标注来源。\n"
-    "3. 若现有文献证据不足以回答该问题，必须明确回答“根据现有文献证据，不足以回答该问题”，不要硬答。\n"
-    "输出语言：简体中文，正文使用 Markdown，但禁止使用任何代码块。"
+    "1. 只能依据提供的【证据n】作答，严禁编造证据之外的事实。\n"
+    "2. 段内每个关键论断后用方括号编号标注来源证据，如 [1] 或 [1][3]；编号必须与证据编号一一对应。\n"
+    "3. 每段末尾另起一行写「参考文献：[n][m]」列出该段引用的全部证据编号。\n"
+    "4. 某段若没有相关证据支撑，该段正文只写「暂无相关文献证据」，不写参考文献行，严禁硬凑。\n"
+    "5. 每条证据标注了段落作用（概念解释/背景说明/方法依据/经验证据/研究空白），"
+    "优先把对应作用的证据用于对应段落，内容相关时也可跨段引用。\n"
+    "6. 直接从「## 概念解释」开始输出，不要任何开场白；禁止使用代码块。\n"
+    "输出语言：简体中文。"
 )
 
 
@@ -539,7 +605,23 @@ class QaRequest(BaseModel):
 
 
 def _build_qa_context(papers: List[GeneratePaper]) -> str:
+    """组装带全局编号的证据块。优先用细粒度 chunks（含 ref_id/段落作用）；
+    旧调用方未传 chunks 时回退为每篇一条证据。"""
     parts: List[str] = []
+    has_chunks = any(p.chunks for p in papers)
+    if has_chunks:
+        for p in papers:
+            doi = p.doi.strip() or f"PaperID:{p.paper_id}"
+            title = p.title.strip() or p.paper_id
+            year = p.publish_year if p.publish_year is not None else "未知"
+            for c in p.chunks:
+                role = c.section_role or "未标注"
+                chapter = c.chapter_title or "未知章节"
+                parts.append(
+                    f"【证据{c.ref_id}】（段落作用: {role} | 章节: {chapter}）{title}|{doi}|{year}\n"
+                    f"{c.text.strip()}"
+                )
+        return "\n\n".join(parts)
     for idx, p in enumerate(papers, start=1):
         doi = p.doi.strip() or f"PaperID:{p.paper_id}"
         title = p.title.strip() or p.paper_id
@@ -563,13 +645,13 @@ def _qa_messages(question: str, papers: List[GeneratePaper],
     context = _build_qa_context(papers)
     prefix = ""
     if not evidence_sufficient:
-        prefix = "请注意：检索到的相关文献较少，请在回答开头加上一句“（注：检索到的相关文献较少，以下结论可信度有限）”。\n\n"
+        prefix = "请注意：检索到的相关文献较少，请在「## 概念解释」之前先单独输出一行“（注：检索到的相关文献较少，以下结论可信度有限）”。\n\n"
     user_prompt = (
         f"{prefix}"
         f"用户问题：{question}\n\n"
-        f"以下是检索到的文献证据：\n\n"
+        f"以下是检索到的带编号文献证据：\n\n"
         f"{context}\n\n"
-        "请基于以上证据直接回答用户问题。"
+        "请严格按系统要求的五段结构、基于以上证据回答用户问题。"
     )
     return [
         {"role": "system", "content": _QA_SYSTEM},

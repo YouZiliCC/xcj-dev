@@ -44,13 +44,30 @@ def ensure_schema(conn: sqlite3.Connection, schema_path: Optional[str] = None) -
 def _ensure_columns(conn: sqlite3.Connection) -> None:
     """对已存在的库幂等补齐新增列（CREATE TABLE IF NOT EXISTS 不会改动旧表）。
 
-    与 backend/migrations/002_affiliation.sql 保持一致。
+    与 backend/migrations/002_affiliation.sql、003_filters_chunkmeta.sql 保持一致。
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(papers_master)").fetchall()}
-    wanted = {"affiliation": "TEXT"}
+    wanted = {
+        "affiliation": "TEXT",
+        "core_type": "TEXT",
+        "is_core": "INTEGER",
+        "clc_number": "TEXT",
+    }
     for col, col_type in wanted.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE papers_master ADD COLUMN {col} {col_type}")
+
+    existing_chunks = {row[1] for row in conn.execute("PRAGMA table_info(paper_chunks)").fetchall()}
+    wanted_chunks = {
+        "chapter_title": "TEXT",
+        "chapter_index": "INTEGER",
+        "section_role": "TEXT",
+        "tag_confidence": "TEXT",
+        "split_method": "TEXT",
+    }
+    for col, col_type in wanted_chunks.items():
+        if col not in existing_chunks:
+            conn.execute(f"ALTER TABLE paper_chunks ADD COLUMN {col} {col_type}")
 
 
 _PAPER_COLUMNS = (
@@ -63,6 +80,9 @@ _PAPER_COLUMNS = (
     "abstract",
     "source_journal",
     "affiliation",
+    "core_type",
+    "is_core",
+    "clc_number",
     "research_design_text",
     "title_tokens",
     "keywords_tokens",
@@ -79,6 +99,11 @@ _CHUNK_COLUMNS = (
     "paragraph_index",
     "offset_start",
     "chunk_text",
+    "chapter_title",
+    "chapter_index",
+    "section_role",
+    "tag_confidence",
+    "split_method",
     "embedding",
 )
 

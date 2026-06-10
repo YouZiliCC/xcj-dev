@@ -26,6 +26,9 @@ type Paper struct {
 	Abstract             string `json:"abstract"`
 	SourceJournal        string `json:"source_journal"`
 	Affiliation          string `json:"affiliation"`
+	CoreType             string `json:"core_type"`
+	IsCore               int    `json:"is_core"`
+	CLCNumber            string `json:"clc_number"`
 	ResearchDesignText   string `json:"research_design_text"`
 	TitleTokens          string `json:"-"`
 	KeywordsTokens       string `json:"-"`
@@ -42,6 +45,11 @@ type Chunk struct {
 	ParagraphIndex int       `json:"paragraph_index"`
 	OffsetStart    int       `json:"offset_start"`
 	ChunkText      string    `json:"chunk_text"`
+	ChapterTitle   string    `json:"chapter_title"`
+	ChapterIndex   int       `json:"chapter_index"`
+	SectionRole    string    `json:"section_role"`
+	TagConfidence  string    `json:"tag_confidence"`
+	SplitMethod    string    `json:"split_method"`
 	Embedding      []float32 `json:"-"`
 }
 
@@ -132,14 +140,16 @@ func splitSQL(s string) []string {
 
 func (d *DB) UpsertPaper(p Paper) error {
 	q := `INSERT INTO papers_master
-(paper_id,title,doi,publish_year,author,keywords,abstract,source_journal,affiliation,research_design_text,
+(paper_id,title,doi,publish_year,author,keywords,abstract,source_journal,affiliation,core_type,is_core,clc_number,research_design_text,
  title_tokens,keywords_tokens,abstract_tokens,research_design_tokens,body_tokens,raw_body)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
 	if d.driver == "sqlite" {
 		q += ` ON CONFLICT(paper_id) DO UPDATE SET
 title=excluded.title, doi=excluded.doi, publish_year=excluded.publish_year,
 author=excluded.author, keywords=excluded.keywords, abstract=excluded.abstract,
-source_journal=excluded.source_journal, affiliation=excluded.affiliation, research_design_text=excluded.research_design_text,
+source_journal=excluded.source_journal, affiliation=excluded.affiliation,
+core_type=excluded.core_type, is_core=excluded.is_core, clc_number=excluded.clc_number,
+research_design_text=excluded.research_design_text,
 title_tokens=excluded.title_tokens, keywords_tokens=excluded.keywords_tokens,
 abstract_tokens=excluded.abstract_tokens, research_design_tokens=excluded.research_design_tokens,
 body_tokens=excluded.body_tokens, raw_body=excluded.raw_body`
@@ -147,13 +157,16 @@ body_tokens=excluded.body_tokens, raw_body=excluded.raw_body`
 		q += ` ON DUPLICATE KEY UPDATE
 title=VALUES(title), doi=VALUES(doi), publish_year=VALUES(publish_year),
 author=VALUES(author), keywords=VALUES(keywords), abstract=VALUES(abstract),
-source_journal=VALUES(source_journal), affiliation=VALUES(affiliation), research_design_text=VALUES(research_design_text),
+source_journal=VALUES(source_journal), affiliation=VALUES(affiliation),
+core_type=VALUES(core_type), is_core=VALUES(is_core), clc_number=VALUES(clc_number),
+research_design_text=VALUES(research_design_text),
 title_tokens=VALUES(title_tokens), keywords_tokens=VALUES(keywords_tokens),
 abstract_tokens=VALUES(abstract_tokens), research_design_tokens=VALUES(research_design_tokens),
 body_tokens=VALUES(body_tokens), raw_body=VALUES(raw_body)`
 	}
 	_, err := d.Exec(q,
-		p.PaperID, p.Title, p.DOI, p.PublishYear, p.Author, p.Keywords, p.Abstract, p.SourceJournal, p.Affiliation, p.ResearchDesignText,
+		p.PaperID, p.Title, p.DOI, p.PublishYear, p.Author, p.Keywords, p.Abstract, p.SourceJournal, p.Affiliation,
+		p.CoreType, p.IsCore, p.CLCNumber, p.ResearchDesignText,
 		p.TitleTokens, p.KeywordsTokens, p.AbstractTokens, p.ResearchDesignTokens, p.BodyTokens, p.RawBody)
 	return err
 }
@@ -162,20 +175,31 @@ body_tokens=VALUES(body_tokens), raw_body=VALUES(raw_body)`
 const paperSelect = `SELECT paper_id,
 COALESCE(title,''), COALESCE(doi,''), COALESCE(publish_year,0),
 COALESCE(author,''), COALESCE(keywords,''), COALESCE(abstract,''),
-COALESCE(source_journal,''), COALESCE(affiliation,''), COALESCE(research_design_text,''),
+COALESCE(source_journal,''), COALESCE(affiliation,''),
+COALESCE(core_type,''), COALESCE(is_core,0), COALESCE(clc_number,''),
+COALESCE(research_design_text,''),
 COALESCE(title_tokens,''), COALESCE(keywords_tokens,''), COALESCE(abstract_tokens,''),
 COALESCE(research_design_tokens,''), COALESCE(body_tokens,''), COALESCE(raw_body,'')
 FROM papers_master`
 
+func scanPaper(scan func(...any) error) (Paper, error) {
+	var p Paper
+	err := scan(&p.PaperID, &p.Title, &p.DOI, &p.PublishYear, &p.Author, &p.Keywords, &p.Abstract, &p.SourceJournal,
+		&p.Affiliation, &p.CoreType, &p.IsCore, &p.CLCNumber, &p.ResearchDesignText,
+		&p.TitleTokens, &p.KeywordsTokens, &p.AbstractTokens, &p.ResearchDesignTokens, &p.BodyTokens, &p.RawBody)
+	return p, err
+}
+
 func (d *DB) GetPaper(id string) (*Paper, error) {
 	row := d.QueryRow(paperSelect+` WHERE paper_id=?`, id)
-	p := &Paper{}
-	err := row.Scan(&p.PaperID, &p.Title, &p.DOI, &p.PublishYear, &p.Author, &p.Keywords, &p.Abstract, &p.SourceJournal,
-		&p.Affiliation, &p.ResearchDesignText, &p.TitleTokens, &p.KeywordsTokens, &p.AbstractTokens, &p.ResearchDesignTokens, &p.BodyTokens, &p.RawBody)
+	p, err := scanPaper(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	return p, err
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 func (d *DB) AllPapers() ([]Paper, error) {
@@ -186,9 +210,8 @@ func (d *DB) AllPapers() ([]Paper, error) {
 	defer rows.Close()
 	var out []Paper
 	for rows.Next() {
-		var p Paper
-		if err := rows.Scan(&p.PaperID, &p.Title, &p.DOI, &p.PublishYear, &p.Author, &p.Keywords, &p.Abstract, &p.SourceJournal,
-			&p.Affiliation, &p.ResearchDesignText, &p.TitleTokens, &p.KeywordsTokens, &p.AbstractTokens, &p.ResearchDesignTokens, &p.BodyTokens, &p.RawBody); err != nil {
+		p, err := scanPaper(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -207,57 +230,72 @@ func (d *DB) CountPapers() (int, error) {
 func (d *DB) UpsertChunk(c Chunk) error {
 	emb := EncodeVector(c.Embedding)
 	q := `INSERT INTO paper_chunks
-(chunk_id,paper_id,chunk_index,paragraph_index,offset_start,chunk_text,embedding)
-VALUES (?,?,?,?,?,?,?)`
+(chunk_id,paper_id,chunk_index,paragraph_index,offset_start,chunk_text,chapter_title,chapter_index,section_role,tag_confidence,split_method,embedding)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
 	if d.driver == "sqlite" {
 		q += ` ON CONFLICT(chunk_id) DO UPDATE SET
 paper_id=excluded.paper_id, chunk_index=excluded.chunk_index,
 paragraph_index=excluded.paragraph_index, offset_start=excluded.offset_start,
-chunk_text=excluded.chunk_text, embedding=excluded.embedding`
+chunk_text=excluded.chunk_text, chapter_title=excluded.chapter_title, chapter_index=excluded.chapter_index,
+section_role=excluded.section_role, tag_confidence=excluded.tag_confidence, split_method=excluded.split_method,
+embedding=excluded.embedding`
 	} else {
 		q += ` ON DUPLICATE KEY UPDATE
 paper_id=VALUES(paper_id), chunk_index=VALUES(chunk_index),
 paragraph_index=VALUES(paragraph_index), offset_start=VALUES(offset_start),
-chunk_text=VALUES(chunk_text), embedding=VALUES(embedding)`
+chunk_text=VALUES(chunk_text), chapter_title=VALUES(chapter_title), chapter_index=VALUES(chapter_index),
+section_role=VALUES(section_role), tag_confidence=VALUES(tag_confidence), split_method=VALUES(split_method),
+embedding=VALUES(embedding)`
 	}
-	_, err := d.Exec(q, c.ChunkID, c.PaperID, c.ChunkIndex, c.ParagraphIndex, c.OffsetStart, c.ChunkText, emb)
+	_, err := d.Exec(q, c.ChunkID, c.PaperID, c.ChunkIndex, c.ParagraphIndex, c.OffsetStart, c.ChunkText,
+		c.ChapterTitle, c.ChapterIndex, c.SectionRole, c.TagConfidence, c.SplitMethod, emb)
 	return err
 }
 
+const chunkSelect = `SELECT chunk_id,paper_id,COALESCE(chunk_index,0),COALESCE(paragraph_index,0),COALESCE(offset_start,0),COALESCE(chunk_text,''),
+COALESCE(chapter_title,''),COALESCE(chapter_index,-1),COALESCE(section_role,''),COALESCE(tag_confidence,''),COALESCE(split_method,''),embedding
+FROM paper_chunks`
+
+func scanChunk(scan func(...any) error) (Chunk, error) {
+	var c Chunk
+	var emb []byte
+	err := scan(&c.ChunkID, &c.PaperID, &c.ChunkIndex, &c.ParagraphIndex, &c.OffsetStart, &c.ChunkText,
+		&c.ChapterTitle, &c.ChapterIndex, &c.SectionRole, &c.TagConfidence, &c.SplitMethod, &emb)
+	if err == nil {
+		c.Embedding = DecodeVector(emb)
+	}
+	return c, err
+}
+
 func (d *DB) AllChunks() ([]Chunk, error) {
-	rows, err := d.Query(`SELECT chunk_id,paper_id,COALESCE(chunk_index,0),COALESCE(paragraph_index,0),COALESCE(offset_start,0),COALESCE(chunk_text,''),embedding FROM paper_chunks`)
+	rows, err := d.Query(chunkSelect)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Chunk
 	for rows.Next() {
-		var c Chunk
-		var emb []byte
-		if err := rows.Scan(&c.ChunkID, &c.PaperID, &c.ChunkIndex, &c.ParagraphIndex, &c.OffsetStart, &c.ChunkText, &emb); err != nil {
+		c, err := scanChunk(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		c.Embedding = DecodeVector(emb)
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
 func (d *DB) ChunksByPaper(paperID string) ([]Chunk, error) {
-	rows, err := d.Query(`SELECT chunk_id,paper_id,COALESCE(chunk_index,0),COALESCE(paragraph_index,0),COALESCE(offset_start,0),COALESCE(chunk_text,''),embedding
-FROM paper_chunks WHERE paper_id=? ORDER BY chunk_index`, paperID)
+	rows, err := d.Query(chunkSelect+` WHERE paper_id=? ORDER BY chunk_index`, paperID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Chunk
 	for rows.Next() {
-		var c Chunk
-		var emb []byte
-		if err := rows.Scan(&c.ChunkID, &c.PaperID, &c.ChunkIndex, &c.ParagraphIndex, &c.OffsetStart, &c.ChunkText, &emb); err != nil {
+		c, err := scanChunk(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		c.Embedding = DecodeVector(emb)
 		out = append(out, c)
 	}
 	return out, rows.Err()
