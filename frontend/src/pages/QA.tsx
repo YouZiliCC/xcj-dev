@@ -77,7 +77,10 @@ export default function QA() {
       const handlers: StreamHandlers<QaMeta> = {
         onMeta: (m) => {
           setReferences(m.references ?? []);
-          setCitations(m.citations ?? []);
+          const cs = m.citations ?? [];
+          setCitations(cs);
+          // 默认展示第一条引用，无需用户点击角标
+          if (cs.length > 0) setActiveRef(cs[0].ref_id);
           setEvidenceSufficient(m.evidence_sufficient ?? true);
         },
         onDelta: (t) => {
